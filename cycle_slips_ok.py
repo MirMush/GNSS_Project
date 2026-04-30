@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import SatOrbits as so
 import datetime as dt
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
 #load file
 filepath = "nuuk1320.24d"
 
@@ -16,7 +19,7 @@ filepath = "nuuk1320.24d"
 rnx = rinexReader("data/nuuk1320.24o")
 rnx.readFile(
     readConst=["G", "E"],
-    sigTypes=["L1", "L2", "C1", "P2"]
+    sigTypes=["L1", "L2", "L5", "L7", "C1", "P2"]
 )
 
 print("Start:", rnx.fileStart)
@@ -34,17 +37,31 @@ C_LIGHT = 299792458.0  # m/s
 GPS_F1 = 1575.42e6
 GPS_F2 = 1227.60e6
 
-# Galileo E1/E5b  (RINEX 2 maps Galileo L1→E1, L2→E5b)
-GAL_F1 = 1575.42e6
-GAL_F2 = 1207.14e6
+# Galileo: E1 (same as GPS L1) + E5b (L7) or E5a (L5)
+GAL_F1  = 1575.42e6   # E1
+GAL_F5  = 1176.45e6   # E5a  (RINEX L5)
+GAL_F7  = 1207.14e6   # E5b  (RINEX L7)
 
-LAMBDA1 = C_LIGHT / GPS_F1  # GPS L1 wavelength, used as fallback for plots
+LAMBDA1 = C_LIGHT / GPS_F1
 
-def _lambdas(svid):
-    """Return (lambda1, lambda2) in metres for the given constellation."""
+def _lambdas(svid, f2_sig="L2"):
+    """Return (lambda1, lambda2) for constellation + actual second signal used."""
     if svid.startswith("E"):
-        return C_LIGHT / GAL_F1, C_LIGHT / GAL_F2
+        f2 = GAL_F7 if f2_sig == "L7" else GAL_F5
+        return C_LIGHT / GAL_F1, C_LIGHT / f2
     return C_LIGHT / GPS_F1, C_LIGHT / GPS_F2
+
+def _get_second_phase(sat_data, svid):
+    """Return (phase_array, signal_name) for the best available second frequency."""
+    if svid.startswith("E"):
+        for sig in ["L7", "L5", "L2"]:
+            if sig in sat_data.columns and sat_data[sig].notna().sum() > 10:
+                return sat_data[sig].values, sig
+        return None, None
+    # GPS
+    if "L2" in sat_data.columns and sat_data["L2"].notna().sum() > 10:
+        return sat_data["L2"].values, "L2"
+    return None, None
 
 def movmedian(data, window):
     return pd.Series(data).rolling(window=int(window), center=True, min_periods=1).median().values
@@ -59,10 +76,15 @@ def identify_cycle_slips(tow, phase):
 
     dt = np.diff(tow)
     dt = np.insert(dt, 0, dt[0])
-    dphi = dphi / dt
 
-    repeated_or_nan = (dphi==0) | np.isnan(dphi) | np.isnan(tow) | np.isnan(phase)
-    keep_idx = ~repeated_or_nan
+    # mask data gaps > 10 s — large jumps across gaps are not real slips
+    dphi[dt > 10] = np.nan
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dphi = np.where(dt > 0, dphi / dt, np.nan)
+
+    invalid = (dphi == 0) | np.isnan(dphi) | np.isinf(dphi) | np.isnan(tow) | np.isnan(phase)
+    keep_idx = ~invalid
     t_clean = tow[keep_idx]
     dphi_clean = dphi[keep_idx]
 
@@ -79,7 +101,7 @@ def identify_cycle_slips(tow, phase):
     return ind_slips, t_clean, dphi_clean, mphi, residual
 
 
-def identify_cycle_slips_gf(tow, l1, l2, svid="G"):
+def identify_cycle_slips_gf(tow, l1, l2, svid="G", sig2="L2"):
     """
     Geometry-Free (GF) cycle slip detection.
 
@@ -89,7 +111,7 @@ def identify_cycle_slips_gf(tow, l1, l2, svid="G"):
     A 1-cycle slip on L1 → jump of λ1; on L2 → jump of λ2.
     Threshold = λ1/2 to catch single-cycle slips.
     """
-    lam1, lam2 = _lambdas(svid)
+    lam1, lam2 = _lambdas(svid, sig2)
 
     _empty = np.array([])
     valid = ~(np.isnan(l1) | np.isnan(l2) | np.isnan(tow))
@@ -125,16 +147,18 @@ def identify_cycle_slips_gf(tow, l1, l2, svid="G"):
     return ind_slips, t_clean, dgf_clean, mgf, residual, lam1
 
 
-# process all satellites — use GF when L2 available, else fall back to L1-only
+# process all satellites — use GF when L2/E5b available, else fall back to L1/E1-only
 results_l1 = {}
 results_gf = {}
 plot_data_l1 = {}
 plot_data_gf = {}
 
-for svid in rnx.obsSvid:
+valid_svids = [sv for sv in rnx.obsSvid if len(sv) >= 3 and sv[1:].isdigit()]
+
+for svid in valid_svids:
     print(f"Processing {svid}...")
 
-    sat_data = rnx.get_svid_data(svid, ["L1", "L2"])
+    sat_data = rnx.get_svid_data(svid, ["L1", "L2", "L5", "L7"])
 
     if sat_data.empty or 'L1' not in sat_data.columns:
         print(f"  No L1 data — skipping")
@@ -143,22 +167,24 @@ for svid in rnx.obsSvid:
     tow      = (sat_data.index - sat_data.index[0]).total_seconds().values
     phase_l1 = sat_data['L1'].values
 
-    # --- L1-only ---
+    # --- L1/E1-only ---
     slips_l1, t_c, d_c, m_c, res_l1 = identify_cycle_slips(tow, phase_l1)
-    results_l1[svid]  = len(slips_l1)
+    results_l1[svid]   = len(slips_l1)
     plot_data_l1[svid] = (t_c, res_l1, slips_l1)
 
-    # --- GF (dual-frequency) ---
-    if 'L2' in sat_data.columns and sat_data['L2'].notna().sum() > 10:
-        phase_l2 = sat_data['L2'].values
-        slips_gf, t_gf, d_gf, m_gf, res_gf, lam1_sv = identify_cycle_slips_gf(tow, phase_l1, phase_l2, svid)
+    # --- GF (dual-frequency) — picks best available second signal ---
+    phase_l2, sig2 = _get_second_phase(sat_data, svid)
+    if phase_l2 is not None:
+        lam1_sv, _ = _lambdas(svid, sig2)
+        slips_gf, t_gf, d_gf, m_gf, res_gf, lam1_sv = identify_cycle_slips_gf(
+            tow, phase_l1, phase_l2, svid, sig2)
         results_gf[svid]   = len(slips_gf)
         plot_data_gf[svid] = (t_gf, res_gf, slips_gf, lam1_sv)
-        print(f"  L1-only: {len(slips_l1)} slips | GF: {len(slips_gf)} slips")
+        print(f"  L1: {len(slips_l1)} slips | GF ({sig2}): {len(slips_gf)} slips")
     else:
-        print(f"  L1-only: {len(slips_l1)} slips | GF: no L2")
+        print(f"  L1: {len(slips_l1)} slips | GF: no second frequency")
 
-# recap
+# recap table
 print("\n" + "="*40)
 print(f"{'SAT':<6}  {'L1 slips':>8}  {'GF slips':>8}")
 print("="*40)
@@ -166,71 +192,63 @@ for sv in results_l1:
     gf_str = str(results_gf[sv]) if sv in results_gf else "N/A"
     print(f"{sv:<6}  {results_l1[sv]:>8}  {gf_str:>8}")
 
-# --- subplot grid: L1 vs GF side-by-side for each satellite ---
-common_svids = [sv for sv in plot_data_l1 if sv in plot_data_gf]
-n    = len(common_svids)
-ncols = 4
-nrows = int(np.ceil(n / ncols))
+# --- TIMELINE PLOT ---
+# one row per satellite, x = time, red marks = detected slips
+all_svids = list(plot_data_l1.keys())
+gps_svids = [sv for sv in all_svids if sv.startswith("G")]
+gal_svids = [sv for sv in all_svids if sv.startswith("E")]
+ordered   = gps_svids + gal_svids
 
-fig, axes = plt.subplots(nrows * 2, ncols,
-                          figsize=(ncols * 4, nrows * 6),
-                          sharey=False)
-axes = np.array(axes).reshape(nrows * 2, ncols)
+fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(ordered) * 0.4)),
+                          gridspec_kw={'width_ratios': [1, 1]})
 
-for i, svid in enumerate(common_svids):
-    row_l1 = (i // ncols) * 2
-    row_gf = row_l1 + 1
-    col    = i % ncols
+for ax, method, data_dict, title, color_slip in [
+    (axes[0], "L1-only",
+     {sv: (plot_data_l1[sv][0], plot_data_l1[sv][1], plot_data_l1[sv][2]) for sv in ordered if sv in plot_data_l1},
+     "L1-only detection", "red"),
+    (axes[1], "GF",
+     {sv: (plot_data_gf[sv][0], plot_data_gf[sv][1], plot_data_gf[sv][2]) for sv in ordered if sv in plot_data_gf},
+     "Geometry-Free detection", "red"),
+]:
+    for yi, svid in enumerate(ordered):
+        if svid not in data_dict:
+            continue
+        t_c, _, slips = data_dict[svid]
+        if len(t_c) == 0:
+            continue
+        # visibility bar
+        color_sv = 'steelblue' if svid.startswith("G") else 'darkorange'
+        ax.plot([t_c[0], t_c[-1]], [yi, yi], color=color_sv, linewidth=1.5, alpha=0.4)
+        # slip markers
+        if len(slips) > 0:
+            ax.scatter(t_c[slips], np.full(len(slips), yi),
+                       color=color_slip, s=12, zorder=5)
 
-    # --- L1 panel ---
-    t_c, res, slips = plot_data_l1[svid]
-    ax = axes[row_l1, col]
-    ax.scatter(t_c, res, s=2, color='black')
-    if len(slips) > 0:
-        ax.scatter(t_c[slips], res[slips], s=15, color='red', zorder=5,
-                   label=f'{len(slips)} slips')
-        ax.legend(fontsize=6, loc='upper right')
-    ax.axhline(y= 1.0, color='r', linestyle='--', linewidth=0.7)
-    ax.axhline(y=-1.0, color='r', linestyle='--', linewidth=0.7)
-    ax.set_title(f"{svid} — L1", fontsize=8)
-    ax.set_ylim([-5, 5])
-    ax.set_ylabel("cycles/s", fontsize=7)
-    ax.tick_params(labelsize=6)
+    ax.set_yticks(range(len(ordered)))
+    ax.set_yticklabels(ordered, fontsize=7)
+    ax.set_xlabel("Time (s)")
+    ax.set_title(title)
+    ax.invert_yaxis()
+    # separator between GPS and Galileo
+    if gal_svids:
+        sep = len(gps_svids) - 0.5
+        ax.axhline(sep, color='grey', linestyle=':', linewidth=0.8)
+        ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else 0,
+                sep - 0.3, "GPS", fontsize=7, color='steelblue')
+        ax.text(ax.get_xlim()[0] if ax.get_xlim()[0] != 0 else 0,
+                sep + 0.8, "Galileo", fontsize=7, color='darkorange')
 
-    # --- GF panel ---
-    t_gf, res_gf, slips_gf, lam1_sv = plot_data_gf[svid]
-    ax2 = axes[row_gf, col]
-    ax2.scatter(t_gf, res_gf, s=2, color='steelblue')
-    if len(slips_gf) > 0:
-        ax2.scatter(t_gf[slips_gf], res_gf[slips_gf], s=15, color='red', zorder=5,
-                    label=f'{len(slips_gf)} slips')
-        ax2.legend(fontsize=6, loc='upper right')
-    ax2.axhline(y= lam1_sv/2, color='r', linestyle='--', linewidth=0.7)
-    ax2.axhline(y=-lam1_sv/2, color='r', linestyle='--', linewidth=0.7)
-    ax2.set_title(f"{svid} — GF", fontsize=8)
-    ax2.set_ylim([-0.5, 0.5])
-    ax2.set_ylabel("metres", fontsize=7)
-    ax2.tick_params(labelsize=6)
-
-# hide unused panels
-total_panels = nrows * 2 * ncols
-for j in range(i + 1, ncols * nrows):
-    axes[(j // ncols) * 2,     j % ncols].set_visible(False)
-    axes[(j // ncols) * 2 + 1, j % ncols].set_visible(False)
-
-fig.supxlabel("Time (s)", fontsize=10)
-fig.suptitle("Cycle Slip Detection — L1-only (black) vs Geometry-Free (blue)", fontsize=11)
+fig.suptitle("Cycle Slip Timeline — red marks = detected slips", fontsize=11)
 plt.tight_layout()
 plt.show()
 
-# --- summary bar chart: L1 vs GF ---
-sv_labels   = list(results_l1.keys())
-counts_l1   = [results_l1[sv] for sv in sv_labels]
-counts_gf   = [results_gf.get(sv, 0) for sv in sv_labels]
+# --- BAR CHART: slip counts per satellite ---
+sv_labels = ordered
+counts_l1 = [results_l1.get(sv, 0) for sv in sv_labels]
+counts_gf = [results_gf.get(sv, 0) for sv in sv_labels]
 
 x = np.arange(len(sv_labels))
 width = 0.4
-
 fig, ax = plt.subplots(figsize=(14, 4))
 ax.bar(x - width/2, counts_l1, width, label='L1-only', color='steelblue')
 ax.bar(x + width/2, counts_gf, width, label='GF (dual-freq)', color='tomato')
@@ -276,3 +294,133 @@ print(f"Distance receiver-G05: {rho/1000:.1f} km")
 # ------------------------------------------------------------------------------------------------
 # PLOT AT 350km
 # ------------------------------------------------------------------------------------------------
+R_EARTH = 6371000.0      # m
+H_IONO = 350000.0        # 350 km
+R_IONO = R_EARTH + H_IONO
+
+
+def ecef_to_latlon(xyz):
+    """
+    Simple spherical Earth ECEF -> lat/lon.
+    Good enough for mapping IPPs visually.
+    """
+    x, y, z = xyz
+    r = np.linalg.norm(xyz)
+    lat = np.degrees(np.arcsin(z / r))
+    lon = np.degrees(np.arctan2(y, x))
+    return lat, lon
+
+
+def ionospheric_pierce_point(rx_xyz, sat_xyz, h_iono=350000.0):
+    """
+    Find intersection between receiver-satellite line and ionospheric shell.
+    Uses spherical Earth approximation.
+    """
+    R = R_EARTH + h_iono
+
+    u = sat_xyz - rx_xyz
+    u = u / np.linalg.norm(u)
+
+    # Solve |rx + t*u|^2 = R^2
+    b = 2 * np.dot(rx_xyz, u)
+    c = np.dot(rx_xyz, rx_xyz) - R**2
+
+    disc = b**2 - 4*c
+    if disc < 0:
+        return None
+
+    t1 = (-b + np.sqrt(disc)) / 2
+    t2 = (-b - np.sqrt(disc)) / 2
+
+    # Need positive intersection in satellite direction
+    t_candidates = [t for t in [t1, t2] if t > 0]
+    if not t_candidates:
+        return None
+
+    t = min(t_candidates)
+    ipp_xyz = rx_xyz + t * u
+
+    return ipp_xyz
+
+
+slip_points = []
+
+for svid in plot_data_gf:
+    t_gf, res_gf, slips, lam1_sv = plot_data_gf[svid]
+
+    if len(slips) == 0:
+        continue
+
+    for slip_idx in slips:
+        slip_time_seconds = t_gf[slip_idx]
+
+        # Convert relative seconds back to absolute epoch
+        epoch = rnx.fileStart + dt.timedelta(seconds=float(slip_time_seconds))
+
+        try:
+            satpos = svpos.getSvPos(epoch)
+
+            if svid not in satpos.index:
+                continue
+
+            sat_xyz = satpos.loc[svid, ['X', 'Y', 'Z']].values.astype(float)
+
+            ipp_xyz = ionospheric_pierce_point(rx_xyz, sat_xyz, H_IONO)
+
+            if ipp_xyz is None:
+                continue
+
+            lat, lon = ecef_to_latlon(ipp_xyz)
+
+            slip_points.append({
+                "svid": svid,
+                "epoch": epoch,
+                "lat": lat,
+                "lon": lon,
+                "residual": res_gf[slip_idx]
+            })
+
+        except Exception as e:
+            print(f"Could not process {svid} at {epoch}: {e}")
+
+slip_df = pd.DataFrame(slip_points)
+print(slip_df.head())
+print(f"Total mapped slips: {len(slip_df)}")
+
+
+fig = plt.figure(figsize=(9, 8))
+ax = plt.axes(projection=ccrs.PlateCarree())
+
+ax.set_extent([-90, -10, 50, 85], crs=ccrs.PlateCarree())  # Greenland + Canada
+
+ax.add_feature(cfeature.LAND, alpha=0.4)
+ax.add_feature(cfeature.OCEAN, alpha=0.3)
+ax.add_feature(cfeature.COASTLINE)
+ax.add_feature(cfeature.BORDERS, linestyle=':')
+
+if not slip_df.empty:
+    sc = ax.scatter(
+        slip_df["lon"],
+        slip_df["lat"],
+        c=np.abs(slip_df["residual"]),
+        s=35,
+        cmap="Reds",
+        edgecolor="black",
+        transform=ccrs.PlateCarree()
+    )
+
+    plt.colorbar(sc, ax=ax, label="|GF residual| [m]")
+
+    for _, row in slip_df.iterrows():
+        ax.text(
+            row["lon"],
+            row["lat"],
+            row["svid"],
+            fontsize=7,
+            transform=ccrs.PlateCarree()
+        )
+
+ax.set_title("Cycle Slips mapped at ionospheric height 350 km")
+ax.gridlines(draw_labels=True)
+
+plt.show()
