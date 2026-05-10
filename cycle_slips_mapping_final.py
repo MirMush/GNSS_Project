@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
 import SatOrbits as so
 import datetime as dt
 import pickle
@@ -163,7 +164,7 @@ def _add_features(ax, full=False):
     return ax
 
 # ---------------------------------------------------------------------------
-# Skyplot — single station
+# Skyplot single station
 # ---------------------------------------------------------------------------
 def make_single_station_skyplot(station, rx_xyz, svids,
                                 file_start, file_end, plot_data_gf,
@@ -173,7 +174,7 @@ def make_single_station_skyplot(station, rx_xyz, svids,
     svids        : ALL satellite IDs to plot tracks for (GPS + Galileo).
     plot_data_gf : raw dict from pkl  {svid: (t_gf, res_gf, slips, lam1)}.
     Slip positions are resolved directly from SP3 so every detected slip
-    above elev_cut is shown — not just those that survived IPP mapping.
+    above elev_cut is shown, not just those that survived IPP mapping.
     """
     fig = plt.figure(figsize=(8, 8))
     ax  = fig.add_subplot(111, projection="polar")
@@ -230,7 +231,7 @@ def make_single_station_skyplot(station, rx_xyz, svids,
                     fontsize=5, color=color, ha="center", va="center",
                     fontweight="bold", alpha=0.9)
 
-        # slip positions — resolved fresh from SP3 (no pre-filtering)
+        # slip positions resolved fresh from SP3 (no pre-filtering)
         if svid not in plot_data_gf:
             continue
         t_gf, _, slips, _ = plot_data_gf[svid]
@@ -259,19 +260,17 @@ def make_single_station_skyplot(station, rx_xyz, svids,
 
         # legend entry only for satellites that have a visible track or slips
         if azs or slip_az_sv:
-            from matplotlib.lines import Line2D
             legend_handles.append(
                 Line2D([0], [0], color=color, linewidth=1.5,
                        linestyle=style, label=svid)
             )
 
-    from matplotlib.lines import Line2D
     # separator entry between GPS and Galileo in legend
     if gps_svids_sorted and gal_svids_sorted:
         gps_handles = [h for h in legend_handles if h.get_label().startswith("G")]
         gal_handles = [h for h in legend_handles if h.get_label().startswith("E")]
         all_handles = (gps_handles
-                       + [Line2D([0], [0], color="none", label="— Galileo —")]
+                       + [Line2D([0], [0], color="none", label="- Galileo -")]
                        + gal_handles
                        + [Line2D([0], [0], color="red", marker="o",
                                  linestyle="None", markersize=5,
@@ -285,7 +284,7 @@ def make_single_station_skyplot(station, rx_xyz, svids,
               fontsize=6, title="Satellite", title_fontsize=7,
               ncol=2)
 
-    ax.set_title(f"Skyplot — {station.upper()}\n"
+    ax.set_title(f"Skyplot: {station.upper()}\n"
                  f"  elev ≥ {elev_cut}°",
                  pad=20, fontsize=11)
     plt.tight_layout()
@@ -332,7 +331,7 @@ def build_ipp_obs(svids, file_start, file_end, rx_xyz,
 
 
 # ---------------------------------------------------------------------------
-# Skyplot — all stations together
+# Skyplot all stations together
 # ---------------------------------------------------------------------------
 def make_combined_skyplot(all_station_data, svpos, out_dir,
                           sample_sec=OBS_SAMPLE_SEC, elev_cut=15):
@@ -408,7 +407,6 @@ def make_combined_skyplot(all_station_data, svpos, out_dir,
         ax.scatter(slip_scatter_az, slip_scatter_el,
                    color="red", s=18, zorder=8, alpha=0.7)
 
-    from matplotlib.lines import Line2D
     legend_handles = [
         Line2D([0], [0], color=stn_color[s], linewidth=1.5, label=s)
         for s in station_names
@@ -431,7 +429,7 @@ def make_combined_skyplot(all_station_data, svpos, out_dir,
 
 
 # ---------------------------------------------------------------------------
-# Combined timeline — GF only, fixed size
+# Combined timeline GF only, fixed size
 # ---------------------------------------------------------------------------
 def make_combined_timeline(pkl_files, out_dir, max_rows=300):
     """
@@ -505,7 +503,6 @@ def make_combined_timeline(pkl_files, out_dir, max_rows=300):
         fontsize=11,
     )
 
-    from matplotlib.lines import Line2D
     ax.legend(handles=[
         Line2D([0], [0], color="steelblue",  linewidth=1.5, label="GPS"),
         Line2D([0], [0], color="darkorange", linewidth=1.5, label="Galileo"),
@@ -643,7 +640,7 @@ for pkl_path in pkl_files:
 
 
 # ===========================================================================
-# COMBINED — all stations
+# COMBINED all stations
 # ===========================================================================
 all_slip_df = pd.DataFrame(all_slip_points)
 all_ipp_df = pd.DataFrame(all_ipp_points)
@@ -672,7 +669,7 @@ if not all_slip_df.empty:
     ax = make_polar_ax(fig)
     ax.scatter(all_slip_df["lon"].values, all_slip_df["lat"].values,
                s=10, c="red", alpha=0.5, transform=DATA_CRS, zorder=5)
-    ax.set_title("Cycle-Slip IPP positions — all stations\n"
+    ax.set_title("Cycle-Slip IPP positions: all stations\n"
                  "one dot = one detected slip", fontsize=10)
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "ALL_map_scatter.png"),
