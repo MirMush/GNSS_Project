@@ -123,7 +123,7 @@ def plot_binned_grid(ax, grid, lon_edges, lat_edges, cmap, norm):
 
 
 # ---------------------------------------------------------------------------
-# Map helpers
+# Map functions
 # ---------------------------------------------------------------------------
 POLAR_PROJ = ccrs.NorthPolarStereo(central_longitude=-40.0)
 DATA_CRS = ccrs.PlateCarree()
@@ -162,6 +162,141 @@ def _add_features(ax, full=False):
     gl.right_labels = False
     return ax
 
+# ---------------------------------------------------------------------------
+# Skyplot — single station
+# ---------------------------------------------------------------------------
+def make_single_station_skyplot(station, rx_xyz, svids,
+                                file_start, file_end, plot_data_gf,
+                                svpos, out_dir,
+                                sample_sec=OBS_SAMPLE_SEC, elev_cut=15):
+    """
+    svids        : ALL satellite IDs to plot tracks for (GPS + Galileo).
+    plot_data_gf : raw dict from pkl  {svid: (t_gf, res_gf, slips, lam1)}.
+    Slip positions are resolved directly from SP3 so every detected slip
+    above elev_cut is shown — not just those that survived IPP mapping.
+    """
+    fig = plt.figure(figsize=(8, 8))
+    ax  = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_ylim(0, 90)
+    ax.set_yticks([0, 15, 30, 45, 60, 75, 85])
+    ax.set_yticklabels(["90°", "75°", "60°", "45°", "30°", "15°", "5°"], fontsize=7)
+    ax.set_rlabel_position(135)
+
+    obs_sec   = (file_end - file_start).total_seconds()
+    t_samples = np.arange(0, obs_sec + sample_sec, sample_sec)
+
+    # assign one colour per satellite (GPS and Galileo use separate palettes)
+    gps_svids_sorted = sorted(sv for sv in svids if sv.startswith("G"))
+    gal_svids_sorted = sorted(sv for sv in svids if sv.startswith("E"))
+    gps_colors = plt.cm.tab20(np.linspace(0, 1, max(len(gps_svids_sorted), 1)))
+    gal_colors = plt.cm.tab20b(np.linspace(0, 1, max(len(gal_svids_sorted), 1)))
+    sv_color = {}
+    for i, sv in enumerate(gps_svids_sorted):
+        sv_color[sv] = gps_colors[i]
+    for i, sv in enumerate(gal_svids_sorted):
+        sv_color[sv] = gal_colors[i]
+
+    legend_handles = []
+
+    for svid in svids:
+        style = "-" if svid.startswith("G") else "--"
+        color = sv_color.get(svid, "grey")
+
+        # satellite track
+        azs, els = [], []
+        for t_sec in t_samples:
+            epoch = file_start + dt.timedelta(seconds=float(t_sec))
+            try:
+                satpos = svpos.getSvPos(epoch, const=["G", "E"])
+                if svid not in satpos.index:
+                    continue
+                sat_xyz = satpos.loc[svid, ["X", "Y", "Z"]].values.astype(float)
+                elev = elevation_angle(rx_xyz, sat_xyz)
+                if elev < elev_cut:
+                    continue
+                az = azimuth_angle(rx_xyz, sat_xyz)
+                azs.append(np.radians(az))
+                els.append(90 - elev)
+            except Exception:
+                continue
+
+        if azs:
+            ax.plot(azs, els, color=color, linewidth=1.2,
+                    alpha=0.75, linestyle=style)
+            mid = len(azs) // 2
+            ax.text(azs[mid], els[mid], svid,
+                    fontsize=5, color=color, ha="center", va="center",
+                    fontweight="bold", alpha=0.9)
+
+        # slip positions — resolved fresh from SP3 (no pre-filtering)
+        if svid not in plot_data_gf:
+            continue
+        t_gf, _, slips, _ = plot_data_gf[svid]
+        slip_az_sv, slip_el_sv = [], []
+        for slip_idx in slips:
+            t_sec = float(t_gf[slip_idx])
+            epoch = file_start + dt.timedelta(seconds=t_sec)
+            try:
+                satpos = svpos.getSvPos(epoch, const=["G", "E"])
+                if svid not in satpos.index:
+                    continue
+                sat_xyz = satpos.loc[svid, ["X", "Y", "Z"]].values.astype(float)
+                elev = elevation_angle(rx_xyz, sat_xyz)
+                if elev < elev_cut:
+                    continue
+                az = azimuth_angle(rx_xyz, sat_xyz)
+                slip_az_sv.append(np.radians(az))
+                slip_el_sv.append(90 - elev)
+            except Exception:
+                continue
+
+        if slip_az_sv:
+            ax.scatter(slip_az_sv, slip_el_sv,
+                       color="red", s=30, zorder=8, alpha=0.9,
+                       marker="o", edgecolors="darkred", linewidths=0.4)
+
+        # legend entry only for satellites that have a visible track or slips
+        if azs or slip_az_sv:
+            from matplotlib.lines import Line2D
+            legend_handles.append(
+                Line2D([0], [0], color=color, linewidth=1.5,
+                       linestyle=style, label=svid)
+            )
+
+    from matplotlib.lines import Line2D
+    # separator entry between GPS and Galileo in legend
+    if gps_svids_sorted and gal_svids_sorted:
+        gps_handles = [h for h in legend_handles if h.get_label().startswith("G")]
+        gal_handles = [h for h in legend_handles if h.get_label().startswith("E")]
+        all_handles = (gps_handles
+                       + [Line2D([0], [0], color="none", label="— Galileo —")]
+                       + gal_handles
+                       + [Line2D([0], [0], color="red", marker="o",
+                                 linestyle="None", markersize=5,
+                                 markeredgecolor="darkred",
+                                 label="Cycle slip")])
+    else:
+        all_handles = legend_handles
+
+    ax.legend(handles=all_handles,
+              loc="upper right", bbox_to_anchor=(1.45, 1.12),
+              fontsize=6, title="Satellite", title_fontsize=7,
+              ncol=2)
+
+    ax.set_title(f"Skyplot — {station.upper()}\n"
+                 f"  elev ≥ {elev_cut}°",
+                 pad=20, fontsize=11)
+    plt.tight_layout()
+    out = os.path.join(out_dir, f"{station}_skyplot.png")
+    plt.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close()
+    n_slips = sum(
+        len(plot_data_gf[sv][2]) for sv in svids if sv in plot_data_gf
+    )
+    print(f" Saved skyplot: {out}  ({n_slips} GF slips total)")
+
 
 # ---------------------------------------------------------------------------
 # n_obs builder
@@ -175,7 +310,7 @@ def build_ipp_obs(svids, file_start, file_end, rx_xyz,
         epoch = file_start + dt.timedelta(seconds=float(t_sec))
         tw_idx = int(t_sec // TIME_WINDOW_SEC)
         try:
-            satpos = svpos.getSvPos(epoch)
+            satpos = svpos.getSvPos(epoch, const=['G', 'E'])
         except Exception:
             continue
         for svid in svids:
@@ -234,7 +369,7 @@ def make_combined_skyplot(all_station_data, svpos, out_dir,
             for t_sec in t_samples:
                 epoch = file_start + dt.timedelta(seconds=float(t_sec))
                 try:
-                    satpos = svpos.getSvPos(epoch)
+                    satpos = svpos.getSvPos(epoch, const=['G', 'E'])
                     if svid not in satpos.index:
                         continue
                     sat_xyz = satpos.loc[svid, ["X", "Y", "Z"]].values.astype(float)
@@ -256,7 +391,7 @@ def make_combined_skyplot(all_station_data, svpos, out_dir,
                 svid = row["svid"]
                 epoch = row["epoch"]
                 try:
-                    satpos = svpos.getSvPos(epoch)
+                    satpos = svpos.getSvPos(epoch, const=['G', 'E'])
                     if svid not in satpos.index:
                         continue
                     sat_xyz = satpos.loc[svid, ["X", "Y", "Z"]].values.astype(float)
@@ -432,7 +567,7 @@ for pkl_path in pkl_files:
             epoch = file_start + dt.timedelta(seconds=t_sec)
             tw_idx = int(t_sec // TIME_WINDOW_SEC)
             try:
-                satpos = svpos.getSvPos(epoch)
+                satpos = svpos.getSvPos(epoch, const=['G', 'E'])
                 if svid not in satpos.index:
                     continue
                 sat_xyz = satpos.loc[svid, ["X", "Y", "Z"]].values.astype(float)
@@ -498,6 +633,13 @@ for pkl_path in pkl_files:
     plt.close()
 
     print(f"Saved maps for {station}")
+
+
+    # Map skyplot for each station
+    make_single_station_skyplot(station, rx_xyz, svids,
+                                file_start, file_end, plot_data_gf,
+                                svpos, OUT_DIR)
+
 
 
 # ===========================================================================
